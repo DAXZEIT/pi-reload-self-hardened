@@ -20,7 +20,7 @@ out immediately, so the tool always falls back to the manual editor path.
 PR #1 removes the monkeypatch in favor of the public API. This repository is
 that design, validated end-to-end on 0.87.1 (2026-09-24: full cycles,
 tool → reload in ~300–700 ms → continuation turn, zero manual intervention),
-plus three hardenings that came from observed failures:
+plus four hardenings that came from observed failures:
 
 ## Production hardening (beyond PR #1)
 
@@ -45,6 +45,29 @@ plus three hardenings that came from observed failures:
    The handler sits on critical plumbing of a process that hosts the agent.
    An extension bug there must not become an `uncaughtException` that takes
    down Pi (observed with the pre-event polling design, 2026-09-24).
+
+4. **Continuation-slot ABI scan + no-silent-failure**
+   `globalThis` survives the runtime replacement, so a slot renamed across a
+   reload (in-flight code change) would be written by the old version and
+   missed by the new one — the continuation would be dropped **silently** and
+   control would just return to the user (observed 2026-09-24: the
+   local→hardened rename crossed a reload). The slot is now scanned across all
+   `__piReloadSelf*ContinuationPrompt` variants, and a reload that comes back
+   without a continuation notifies the user instead of failing silently.
+
+## Tests
+
+```sh
+npm run check   # tsc --noEmit + node:test suite (13 tests)
+```
+
+The fake `pi.sendUserMessage` returns `undefined` by default — exactly the
+real 0.87.1 runtime behavior — so every dispatch test exercises the
+undefined-return path. Covered: registration, confirmation gate, queue/dedup/
+one-shot dispatch, `agent_settled` timing, rejecting `sendUserMessage`, handler
+exception isolation, in-command idle guard, invalid payload (with/without ui),
+reload + continuation delivery, legacy slot recovery, most-recent-slot
+preference, continuation-less reload notification, copied command text.
 
 ## How it works
 

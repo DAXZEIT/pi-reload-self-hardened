@@ -1,9 +1,39 @@
 {
   "name": "pi-reload-self-hardened",
-  "version": "0.2.0",
+  "version": "0.2.1",
+  "type": "module",
   "description": "Pi extension: the agent reloads Pi itself from a tool call and continues the session — public agent_settled dispatch (pi-reload-self PR #1 design) + production hardening validated on Pi 0.87.1",
   "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "coding-agent",
+    "reload",
+    "typescript"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DAXZEIT/pi-reload-self-hardened.git"
+  },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "PI_RELOAD_SELF_HARDENED_LOG=/tmp/pi-reload-self-hardened.test.log node --import tsx --test tests/extension.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.87.1",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.87.1",
+    "@types/node": "^22.15.32",
+    "tsx": "^4.20.3",
+    "typebox": "^1.0.55",
+    "typescript": "^5.8.3"
   }
 }

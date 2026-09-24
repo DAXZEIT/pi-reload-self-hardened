@@ -37,7 +37,8 @@ const COMMAND_NAME = "pi-reload-self-hardened-run";
 const TOOL_NAME = "pi_extension_dev_reload_self";
 const CONTINUATION_SLOT = "__piReloadSelfHardenedContinuationPrompt";
 const PENDING_COMMAND_SLOT = "__piReloadSelfHardenedPendingCommand";
-const LOG_FILE = "/tmp/pi-reload-self-hardened.log";
+// Surchargeable via env pour l'isolation des tests.
+const LOG_FILE = process.env.PI_RELOAD_SELF_HARDENED_LOG ?? "/tmp/pi-reload-self-hardened.log";
 
 function log(msg: string): void {
   try {
