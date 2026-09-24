@@ -1,0 +1,9 @@
+{
+  "name": "pi-reload-self-hardened",
+  "version": "0.2.0",
+  "description": "Pi extension: the agent reloads Pi itself from a tool call and continues the session — public agent_settled dispatch (pi-reload-self PR #1 design) + production hardening validated on Pi 0.87.1",
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
