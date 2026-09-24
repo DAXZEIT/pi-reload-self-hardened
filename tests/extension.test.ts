@@ -14,6 +14,7 @@ import extension from "../index.ts";
 const COMMAND_NAME = "pi-reload-self-hardened-run";
 const TOOL_NAME = "pi_extension_dev_reload_self";
 const CURRENT_SLOT = "__piReloadSelfHardenedContinuationPrompt";
+const PENDING_SLOT = "__piReloadSelfHardenedPendingCommand";
 const LEGACY_SLOT = "__piReloadSelfLocalContinuationPrompt";
 
 function encode(payload: { continuationPrompt: string }): string {
@@ -39,13 +40,16 @@ interface FakeCommandContext {
   ui?: { notify: (message: string, level: string) => void };
 }
 
-type SettledHandler = (event: unknown, ctx: { isIdle?: () => boolean }) => unknown;
+type SettledHandler = (event: unknown, ctx: { isIdle?: () => boolean; ui?: { notify: (message: string, level: string) => void } }) => unknown;
 type SessionStartHandler = (event: unknown, ctx: { ui?: { notify: (message: string, level: string) => void } }) => unknown;
 
 async function loadExtension(
   sendUserMessageImpl?: (content: string, options?: { deliverAs?: string; expandPromptTemplates?: boolean }) => unknown,
+  opts?: { keepSlots?: boolean },
 ) {
-  clearSlots();
+  // keepSlots : ne pas effacer globalThis — utilisé pour simuler le runtime
+  // SUIVANT qui reprend un état restauré dans globalThis (survit au reload).
+  if (!opts?.keepSlots) clearSlots();
 
   const commands = new Map<string, RegisteredCommand>();
   const tools = new Map<string, RegisteredTool>();
@@ -291,6 +295,172 @@ test("session_start(reload) without continuation notifies the user", async () =>
   notifications.length = 0;
   await sessionStart({ reason: "startup" }, ctx);
   assert.deepEqual(notifications, []);
+});
+
+test("command discards the continuation and notifies when reload rejects (C1)", async () => {
+  const { commands } = await loadExtension();
+  const command = commands.get(COMMAND_NAME);
+  assert.ok(command);
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  await assert.doesNotReject(async () => {
+    await command.handler(encode({ continuationPrompt: "continue" }), {
+      isIdle: () => true,
+      reload: async () => {
+        throw new Error("settings reload failed");
+      },
+      ui: { notify: (message, level) => notifications.push({ message, level }) },
+    });
+  });
+
+  // La continuation ne doit JAMAIS survivre à un reload échoué (C1).
+  assert.equal((globalThis as Record<string, unknown>)[CURRENT_SLOT], undefined);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].level, "error");
+});
+
+test("session_start(non-reload) drops a lingering continuation without delivering it (C3)", async () => {
+  const { sentUserMessages, handlers } = await loadExtension();
+  const sessionStart = handlers.get("session_start")?.[0] as SessionStartHandler;
+  assert.ok(sessionStart);
+
+  (globalThis as Record<string, unknown>)[CURRENT_SLOT] = "STALE-CONTINUATION";
+  const notifications: Array<{ message: string; level: string }> = [];
+  await sessionStart({ reason: "new", previousSessionFile: "/tmp/other.json" }, {
+    ui: { notify: (message: string, level: string) => notifications.push({ message, level }) },
+  });
+
+  assert.deepEqual(sentUserMessages, []);
+  assert.equal((globalThis as Record<string, unknown>)[CURRENT_SLOT], undefined);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].level, "warning");
+});
+
+test("session_start(fork) warns and clears a pending reload command (C2a)", async () => {
+  const { tools, handlers } = await loadExtension();
+  const sessionStart = handlers.get("session_start")?.[0] as SessionStartHandler;
+  assert.ok(sessionStart);
+  await tools.get(TOOL_NAME)?.execute("tool-1", { continuation_prompt: "continue", confirm_state_loss: true });
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  await sessionStart({ reason: "fork" }, {
+    ui: { notify: (message: string, level: string) => notifications.push({ message, level }) },
+  });
+
+  assert.equal((globalThis as Record<string, unknown>)[PENDING_SLOT], undefined);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].level, "warning");
+});
+
+test("command idle-guard refusal re-queues and retries at the next settle (N1)", async () => {
+  const { commands, tools, sentUserMessages, handlers } = await loadExtension();
+  const command = commands.get(COMMAND_NAME);
+  const settled = handlers.get("agent_settled")?.[0] as SettledHandler;
+  assert.ok(command);
+  assert.ok(settled);
+  await tools.get(TOOL_NAME)?.execute("tool-1", { continuation_prompt: "continue", confirm_state_loss: true });
+
+  // Première tentative : settle idle → dispatch, mais le guard refuse et
+  // remet la commande en file au lieu de la jeter.
+  await settled({}, { isIdle: () => true });
+  assert.equal(sentUserMessages.length, 1);
+  const notifications: Array<{ message: string; level: string }> = [];
+  let reloaded = false;
+  await command.handler(sentUserMessages[0].content, {
+    isIdle: () => false,
+    reload: async () => {
+      reloaded = true;
+    },
+    ui: { notify: (message, level) => notifications.push({ message, level }) },
+  });
+  assert.equal(reloaded, false);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].level, "warning");
+  assert.notEqual((globalThis as Record<string, unknown>)[PENDING_SLOT], undefined); // remis en file
+
+  // Second settle idle → exactement UN dispatch supplémentaire.
+  await settled({}, { isIdle: () => true });
+  assert.equal(sentUserMessages.length, 2);
+});
+
+test("settled handler re-stores the command when sendUserMessage throws synchronously (C2c)", async () => {
+  const first = await loadExtension(() => {
+    throw new Error("Extension runtime stale after session replacement");
+  });
+  const settled = first.handlers.get("agent_settled")?.[0] as SettledHandler;
+  assert.ok(settled);
+  await first.tools.get(TOOL_NAME)?.execute("tool-1", { continuation_prompt: "continue", confirm_state_loss: true });
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  await assert.doesNotReject(async () => {
+    await Promise.resolve(settled({}, { isIdle: () => true, ui: { notify: (message: string, level: string) => notifications.push({ message, level }) } }));
+  });
+
+  // Commande restaurée (retry au prochain settlement) + avertissement.
+  // (Le fake enregistre le message AVANT que le send ne throw — seuls le
+  // re-store du slot et l'avertissement prouvent que le dispatch a échoué.)
+  assert.notEqual((globalThis as Record<string, unknown>)[PENDING_SLOT], undefined);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].level, "warning");
+
+  // Le runtime SUIVANT (envoi normal) reprend la commande restaurée :
+  // exactement un dispatch.
+  const second = await loadExtension(undefined, { keepSlots: true });
+  const settled2 = second.handlers.get("agent_settled")?.[0] as SettledHandler;
+  assert.ok(settled2);
+  await settled2({}, { isIdle: () => true });
+  assert.equal(second.sentUserMessages.length, 1);
+  assert.match(second.sentUserMessages[0].content, new RegExp(`^\\/${COMMAND_NAME} [A-Za-z0-9_-]+$`));
+});
+
+test("non-string legacy continuation slot is logged and cleared, nothing delivered (N2a)", async () => {
+  const { sentUserMessages, handlers } = await loadExtension();
+  const sessionStart = handlers.get("session_start")?.[0] as SessionStartHandler;
+  assert.ok(sessionStart);
+
+  (globalThis as Record<string, unknown>)[LEGACY_SLOT] = { prompt: "structured payload from an old version" };
+  const notifications: Array<{ message: string; level: string }> = [];
+  await sessionStart({ reason: "reload" }, {
+    ui: { notify: (message: string, level: string) => notifications.push({ message, level }) },
+  });
+
+  assert.deepEqual(sentUserMessages, []);
+  assert.equal((globalThis as Record<string, unknown>)[LEGACY_SLOT], undefined);
+  // L'avertissement « reload sans continuation » existant couvre le cas —
+  // pas de seconde notification (décision N2a).
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].level, "warning");
+});
+
+test("idle-guard gives up after 3 refusals and discards the command (N1 cap)", async () => {
+  const { commands } = await loadExtension();
+  const command = commands.get(COMMAND_NAME);
+  assert.ok(command);
+
+  const args = encode({ continuationPrompt: "continue" });
+  const notifications: Array<{ message: string; level: string }> = [];
+  let reloaded = false;
+  const ctx = {
+    isIdle: () => false,
+    reload: async () => {
+      reloaded = true;
+    },
+    ui: { notify: (message: string, level: string) => notifications.push({ message, level }) },
+  };
+
+  // 3 premiers refus : la commande est remise en file (warning).
+  for (let i = 0; i < 3; i++) {
+    await command.handler(args, ctx);
+    assert.notEqual((globalThis as Record<string, unknown>)[PENDING_SLOT], undefined);
+  }
+  assert.equal(notifications.filter((n) => n.level === "warning").length, 3);
+
+  // 4e refus : plafond atteint — la commande est jetée (error), plus de retry.
+  await command.handler(args, ctx);
+  assert.equal(reloaded, false);
+  assert.equal((globalThis as Record<string, unknown>)[PENDING_SLOT], undefined);
+  assert.equal(notifications.length, 4);
+  assert.equal(notifications[3].level, "error");
 });
 
 test("command accepts the full copied command text", async () => {

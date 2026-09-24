@@ -34,40 +34,60 @@ plus four hardenings that came from observed failures:
    written** — only its length.
 
 2. **`Promise.resolve()` around `pi.sendUserMessage()`**
-   The extension binding returns `undefined` at runtime (the internal
-   wrapper catches errors itself but does *not* return the promise), despite
-   the `Promise<void>` type. Chaining `.catch` directly crashes the process:
-   `TypeError: Cannot read properties of undefined (reading 'catch')`
-   (observed, 2026-09-24). `Promise.resolve(...)` is safe in both worlds —
-   the current runtime and a future one that returns a real promise.
+   The extension binding returns `undefined` at runtime — the internal
+   wrapper (`agent-session.js`, `bindCore`) catches errors itself but has no
+   `return`, and the shipped 0.87.1 `types.d.ts` declares the call as `void`
+   (not `Promise<void>`). Chaining `.catch` directly then throws
+   `TypeError: Cannot read properties of undefined (reading 'catch')`. Inside
+   an event handler that TypeError is silently swallowed by the runner's
+   per-handler isolation (`runner.emit`), but the same call *outside* a
+   handler — a timer, which this project's earlier polling design used —
+   crashes the process (observed, 2026-09-24). `Promise.resolve(...)` is safe
+   in both worlds — the current runtime and a future one that returns a real,
+   possibly rejecting, promise.
 
-3. **`try/catch` isolation in the `agent_settled` handler**
-   The handler sits on critical plumbing of a process that hosts the agent.
-   An extension bug there must not become an `uncaughtException` that takes
-   down Pi (observed with the pre-event polling design, 2026-09-24).
+3. **`try/catch` isolation in the event handlers**
+   The handlers sit on critical plumbing of a process that hosts the agent,
+   and an extension bug there must not become an `uncaughtException` that
+   takes down Pi (observed with the pre-event polling design, 2026-09-24).
+   Note: Pi 0.87.1's `runner.emit` already isolates each event handler, so
+   this is belt-and-braces against *future* runners without per-handler
+   isolation — applied consistently to both the `agent_settled` and the
+   `session_start` handler.
 
-4. **Continuation-slot ABI scan + no-silent-failure**
+4. **Slot ABI scans + no-silent-failure**
    `globalThis` survives the runtime replacement, so a slot renamed across a
    reload (in-flight code change) would be written by the old version and
    missed by the new one — the continuation would be dropped **silently** and
    control would just return to the user (observed 2026-09-24: the
-   local→hardened rename crossed a reload). The slot is now scanned across all
-   `__piReloadSelf*ContinuationPrompt` variants, and a reload that comes back
-   without a continuation notifies the user instead of failing silently.
+   local→hardened rename crossed a reload). Both state slots are now scanned
+   across all ABI variants — `__piReloadSelf*ContinuationPrompt` for the
+   continuation and `__piReloadSelf*PendingCommand` for the pending command
+   (same in-flight-rename hazard, one step earlier in the cycle) — most
+   recently written wins, all variants cleared, non-string leftovers logged
+   and dropped. And residual state is never discarded silently: a reload that
+   comes back without a continuation, a pending command abandoned by a
+   session change, a synchronously-failed dispatch, or a leftover
+   continuation on a non-reload `session_start` each notify the user.
 
 ## Tests
 
 ```sh
-npm run check   # tsc --noEmit + node:test suite (13 tests)
+npm run check   # tsc --noEmit + node:test suite (20 tests)
 ```
 
 The fake `pi.sendUserMessage` returns `undefined` by default — exactly the
 real 0.87.1 runtime behavior — so every dispatch test exercises the
-undefined-return path. Covered: registration, confirmation gate, queue/dedup/
-one-shot dispatch, `agent_settled` timing, rejecting `sendUserMessage`, handler
-exception isolation, in-command idle guard, invalid payload (with/without ui),
-reload + continuation delivery, legacy slot recovery, most-recent-slot
-preference, continuation-less reload notification, copied command text.
+undefined-return path; the harness also models rejecting and
+synchronously-throwing sends. Covered: registration, confirmation gate,
+queue/dedup/one-shot dispatch, `agent_settled` timing, rejecting
+`sendUserMessage`, handler exception isolation, in-command idle guard,
+invalid payload (with/without ui), reload + continuation delivery, legacy
+slot recovery, most-recent-slot preference, continuation-less reload
+notification, copied command text, failed-`ctx.reload()` continuation
+discard (C1), non-reload `session_start` residual drop (C3), pending-drop
+warning (C2a), idle-guard re-queue and retry (N1), synchronous-send failure
+re-store (C2c), non-string legacy slot (N2a), idle-guard retry cap (N1).
 
 ## How it works
 
@@ -100,6 +120,16 @@ pi install <path-or-url-to-this-repo>
 Then run `/reload` **once, manually** — chicken-and-egg: the tool does not
 exist until the extension is loaded. Every reload after that can be triggered
 by the agent itself.
+
+## Notes
+
+- **Peer floor**: `peerDependencies: >=0.87.1` is what this fork was actually
+  validated against. An upstream version of this work would re-derive the
+  floor from PR #1's `>=0.84.2` before claiming wider compatibility.
+- **Do not install alongside upstream `pi-reload-self`**: the tool name
+  intentionally collides (`pi_extension_dev_reload_self` is the same tool) —
+  two copies registering the same tool name produce registration-order-
+  dependent behavior. Keep exactly one of the two.
 
 ## Provenance
 

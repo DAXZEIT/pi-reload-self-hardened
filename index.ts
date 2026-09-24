@@ -24,27 +24,43 @@
  * logging fichier (le PR est silencieux), `Promise.resolve` sur
  * `sendUserMessage` (le binding d'extension retourne `undefined`, wrapper
  * interne sans return — un `.catch` direct crashait pi, payé le 2026-09-24),
- * et balayage ABI du slot de continuation (globalThis survit au reload : un
+ * et balayage ABI des slots globalThis (globalThis survit au reload : un
  * renommage de slot EN VOL perdit la continuation le 2026-09-24 — on lit
- * toutes les variantes `__piReloadSelf*ContinuationPrompt` plutôt qu'un nom
- * exact, et on avertit l'utilisateur si un reload revient sans continuation).
+ * toutes les variantes `__piReloadSelf*ContinuationPrompt` /
+ * `__piReloadSelf*PendingCommand` plutôt qu'un nom exact).
+ *
+ * Correctifs revue adversariale 2026-09-25 (C1/C2a/C2c/C3/N1/N2/N5) : la
+ * continuation n'est plus livrée que sur session_start(reload) et ne survit
+ * jamais à un reload échoué ; une commande pending jetée par un changement de
+ * session ou un send synchrone en échec est restaurée (retry au prochain
+ * settlement) ; le refus du garde d'idle remet la commande en file (plafond
+ * 3) ; chaque perte d'état prévient l'utilisateur — jamais de silence.
  */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, renameSync, statSync } from "node:fs";
 
 const COMMAND_NAME = "pi-reload-self-hardened-run";
 const TOOL_NAME = "pi_extension_dev_reload_self";
 const CONTINUATION_SLOT = "__piReloadSelfHardenedContinuationPrompt";
 const PENDING_COMMAND_SLOT = "__piReloadSelfHardenedPendingCommand";
+// Compteur de refus du garde d'idle (N1) : volontairement hors des patterns
+// ContinuationPrompt/PendingCommand — c'est un compteur de runtime, pas un
+// état à migrer entre versions, il ne doit JAMAIS être balayé comme un slot ABI.
+const RETRY_COUNT_SLOT = "__piReloadSelfHardenedRetryCount";
+// Plafond de refus du garde d'idle avant abandon (N1).
+const IDLE_GUARD_MAX_RETRIES = 3;
+// Garde-fou taille du log (N5) : au-delà, on renomme en <fichier>.1 (écrasé).
+const LOG_MAX_BYTES = 1_000_000;
 // Surchargeable via env pour l'isolation des tests.
 const LOG_FILE = process.env.PI_RELOAD_SELF_HARDENED_LOG ?? "/tmp/pi-reload-self-hardened.log";
 
 function log(msg: string): void {
   try {
+    if (statSync(LOG_FILE).size > LOG_MAX_BYTES) renameSync(LOG_FILE, `${LOG_FILE}.1`);
     appendFileSync(LOG_FILE, `${new Date().toISOString()} ${msg}\n`);
   } catch {
-    // diagnostic optionnel
+    // diagnostic optionnel — ne doit JAMAIS jeter dans le flux
   }
 }
 
@@ -82,19 +98,25 @@ function storeContinuationPrompt(prompt: string): void {
 }
 
 // ABI entre runtimes : globalThis survit au remplacement du runtime, donc le
- // code chargé après un reload peut lire un slot écrit par une version
- // antérieure (renommage en vol — payé le 2026-09-24, local→hardened). On
- // balaye toutes les variantes du slot plutôt qu'un nom exact ; le dernier
- // inséré (ordre d'insertion des clés) est le plus récent.
+// code chargé après un reload peut lire un slot écrit par une version
+// antérieure (renommage en vol — payé le 2026-09-24, local→hardened). On
+// balaye toutes les variantes du slot plutôt qu'un nom exact.
+// NB (N3) : « le plus récemment écrit gagne » s'appuie sur l'ordre d'insertion
+// des clés non-entières d'un objet JS (un delete+ré-insertion déplace une clé
+// en fin) — une hypothèse qui marche en pratique, pas une garantie du langage.
 const CONTINUATION_SLOT_PATTERN = /^__piReloadSelf\w*ContinuationPrompt$/;
+// Même traitement pour la commande pending : c'est le même risque de
+// renommage en vol, un cran plus tôt dans le cycle (N2b).
+const PENDING_COMMAND_SLOT_PATTERN = /^__piReloadSelf\w*PendingCommand$/;
 
 function takeContinuationPrompt(): string | undefined {
   const state = globalState();
   let latest: string | undefined;
   for (const key of Object.keys(state)) {
     if (CONTINUATION_SLOT_PATTERN.test(key)) {
-      const value = state[key] as string | undefined;
+      const value = state[key];
       if (typeof value === "string") latest = value;
+      else log(`slot legacy non-string (${typeof value}) jeté`); // N2a
       delete state[key];
     }
   }
@@ -103,44 +125,92 @@ function takeContinuationPrompt(): string | undefined {
 
 function storePendingReloadCommand(command: string): boolean {
   const state = globalState();
-  if (typeof state[PENDING_COMMAND_SLOT] === "string") return false; // déjà en file
+  // Dedup sur toutes les variantes ABI : une commande déjà en file (y compris
+  // écrite par une version antérieure) n'est pas remplacée.
+  for (const key of Object.keys(state)) {
+    if (PENDING_COMMAND_SLOT_PATTERN.test(key) && typeof state[key] === "string") return false; // déjà en file
+  }
   state[PENDING_COMMAND_SLOT] = command;
   return true;
 }
 
 function takePendingReloadCommand(): string | undefined {
   const state = globalState();
-  const command = state[PENDING_COMMAND_SLOT] as string | undefined;
-  delete state[PENDING_COMMAND_SLOT];
-  return command;
+  let latest: string | undefined;
+  for (const key of Object.keys(state)) {
+    if (PENDING_COMMAND_SLOT_PATTERN.test(key)) {
+      const value = state[key];
+      if (typeof value === "string") latest = value;
+      else log(`slot pending non-string (${typeof value}) jeté`);
+      delete state[key];
+    }
+  }
+  return latest;
 }
 
-function clearPendingReloadCommand(): void {
-  delete globalState()[PENDING_COMMAND_SLOT];
+// session_start : une commande en attente appartient au run qui l'a créée —
+// si la session est remplacée avant son settlement, elle est abandonnée.
+// Retourne la commande jetée (C2a : prévenir l'utilisateur) ou undefined.
+function clearPendingReloadCommand(): string | undefined {
+  return takePendingReloadCommand();
+}
+
+function retryCount(): number {
+  const value = globalState()[RETRY_COUNT_SLOT];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
 export default async function reloadSelfHardenedExtension(pi: ExtensionAPI): Promise<void> {
   // Après un reload, le prompt de continuation (stocké dans globalThis, qui
-  // survit à la mort du runtime) repart en message user follow-up.
+  // survit à la mort du runtime) repart en message user follow-up — mais
+  // UNIQUEMENT si ce session_start est le nôtre (reason "reload"). Toute
+  // autre raison signifie que la session a changé sans rapport avec le
+  // rechargement : un état résiduel y serait injecté à tort.
   pi.on("session_start", (event, ctx) => {
-    // Une commande en attente appartient au run qui l'a créée : si la session
-    // est remplacée avant son settlement, on ne la porte pas vers l'avant.
-    clearPendingReloadCommand();
+    try {
+      const reason = String((event as { reason?: string }).reason);
 
-    const continuationPrompt = takeContinuationPrompt();
-    if (continuationPrompt) {
-      log(`session_start(${String((event as { reason?: string }).reason)}): continuation envoyée (${continuationPrompt.length} chars)`);
-      // Le binding d'extension peut retourner undefined (wrapper interne sans
-      // return) : Promise.resolve évite un crash et reste compatible avec un
-      // futur pi qui retournerait une vraie promise.
-      void Promise.resolve(pi.sendUserMessage(continuationPrompt, { deliverAs: "followUp" })).catch((e: unknown) =>
-        log(`continuation: envoi échoué — ${String(e instanceof Error ? e.message : e)}`),
-      );
-    } else if (String((event as { reason?: string }).reason) === "reload") {
-      // Perte de continuation après un reload : ne jamais laisser l'utilisateur
-      // deviner pourquoi le rechargement ne s'est pas enchaîné.
-      log("session_start(reload): AUCUNE continuation — la main est rendue à l'utilisateur");
-      ctx.ui?.notify?.("pi-reload-self-hardened : rechargement effectué SANS continuation (perdue ou jamais stockée) — la main t'est rendue", "warning");
+      // C2a : une commande pending jetée ici = un rechargement demandé puis
+      // abandonné sans dispatch (la session a fork/new/resume avant le
+      // settlement). On prévient, on n'efface pas en silence.
+      const droppedPending = clearPendingReloadCommand();
+      if (droppedPending) {
+        log(`session_start(${reason}): commande pending abandonnée (${droppedPending.length} chars)`);
+        ctx.ui?.notify?.("pi-reload-self-hardened : rechargement en attente abandonné — la session a changé avant le settlement", "warning");
+      }
+
+      // C3 : la continuation n'est livrée QUE sur un session_start causé par
+      // notre reload ; sinon elle serait injectée dans une session qui n'a
+      // rien demandé (c'est le scénario C1 : reload échoué puis session new).
+      if (reason !== "reload") {
+        const residual = takeContinuationPrompt();
+        if (residual !== undefined) {
+          log(`session_start(${reason}): continuation résiduelle jetée (${residual.length} chars)`);
+          ctx.ui?.notify?.("pi-reload-self-hardened : continuation résiduelle jetée — la session a changé", "warning");
+        }
+        return;
+      }
+
+      const continuationPrompt = takeContinuationPrompt();
+      if (continuationPrompt) {
+        log(`session_start(${reason}): continuation envoyée (${continuationPrompt.length} chars)`);
+        // Le binding d'extension peut retourner undefined (wrapper interne sans
+        // return) : Promise.resolve évite un crash et reste compatible avec un
+        // futur pi qui retournerait une vraie promise.
+        void Promise.resolve(pi.sendUserMessage(continuationPrompt, { deliverAs: "followUp" })).catch((e: unknown) =>
+          log(`continuation: envoi échoué — ${String(e instanceof Error ? e.message : e)}`),
+        );
+      } else {
+        // Perte de continuation après un reload : ne jamais laisser l'utilisateur
+        // deviner pourquoi le rechargement ne s'est pas enchaîné.
+        log("session_start(reload): AUCUNE continuation — la main est rendue à l'utilisateur");
+        ctx.ui?.notify?.("pi-reload-self-hardened : rechargement effectué SANS continuation (perdue ou jamais stockée) — la main t'est rendue", "warning");
+      }
+    } catch (e) {
+      // Même défense que agent_settled : 0.87.1 isole déjà chaque handler
+      // dans runner.emit, ce try/catch est un filet pour des runners futurs
+      // sans isolation par handler — un bug du fork ne doit jamais tuer pi.
+      log(`session_start: erreur — ${String(e instanceof Error ? (e.stack ?? e.message) : e)}`);
     }
   });
 
@@ -153,9 +223,27 @@ export default async function reloadSelfHardenedExtension(pi: ExtensionAPI): Pro
       const command = takePendingReloadCommand();
       if (!command) return;
       log("agent_settled: commande dispatchée");
-      void Promise.resolve(pi.sendUserMessage(command, { deliverAs: "followUp", expandPromptTemplates: true })).catch((e: unknown) =>
-        log(`agent_settled: envoi échoué — ${String(e instanceof Error ? e.message : e)}`),
-      );
+      try {
+        void Promise.resolve(pi.sendUserMessage(command, { deliverAs: "followUp", expandPromptTemplates: true })).catch((e: unknown) =>
+          log(`agent_settled: envoi échoué — ${String(e instanceof Error ? e.message : e)}`),
+        );
+        // Dispatch accepté (le binding avale les erreurs asynchrones
+        // internes — K4, non corrigeable côté extension) : le compteur de
+        // refus du garde d'idle repart de zéro.
+        globalState()[RETRY_COUNT_SLOT] = 0;
+      } catch (e) {
+        // C2c : sendUserMessage a throw de façon synchrone (runtime stale
+        // après remplacement de session, …). La commande était déjà consommée
+        // du slot : on la restaure pour que le prochain settlement réessaie,
+        // et on prévient l'utilisateur au lieu de perdre le rechargement en
+        // silence.
+        // NB : une commande restaurée survit dans globalThis et sera reprise
+        // par le handler agent_settled du PROCHAIN runtime après un
+        // remplacement de session — c'est voulu, pas un bug.
+        storePendingReloadCommand(command);
+        log(`agent_settled: envoi synchrone en échec — commande restaurée — ${String(e instanceof Error ? (e.stack ?? e.message) : e)}`);
+        ctx.ui?.notify?.("pi-reload-self-hardened : envoi de la commande de rechargement échoué — nouvelle tentative au prochain settlement", "warning");
+      }
     } catch (e) {
       // Un bug du fork ne doit jamais tuer le process pi depuis un handler.
       log(`agent_settled: erreur — ${String(e instanceof Error ? (e.stack ?? e.message) : e)}`);
@@ -178,13 +266,38 @@ export default async function reloadSelfHardenedExtension(pi: ExtensionAPI): Pro
       // n'est pas totalement finie, Pi consommerait la commande sans recharger
       // (« Wait for the current response to finish before reloading »).
       if (ctx.isIdle?.() !== true) {
-        log("commande: agent pas idle — refusé, fin de réponse requise");
-        ctx.ui?.notify?.("pi-reload-self-hardened : attends la fin de la réponse en cours avant de recharger", "warning");
+        // N1 : au lieu de jeter la commande (le texte dispatché est `args`,
+        // déjà consommé du slot par agent_settled), on le remet en file pour
+        // le prochain settlement, avec un plafond pour éviter une boucle sur
+        // une session jamais idle.
+        const refusals = retryCount() + 1;
+        globalState()[RETRY_COUNT_SLOT] = refusals;
+        if (refusals > IDLE_GUARD_MAX_RETRIES) {
+          // Plafond atteint : la commande est JETÉE (on vide le slot au cas
+          // où un chemin ne l'aurait pas consommé) et on arrête de réessayer.
+          takePendingReloadCommand();
+          log(`commande: agent pas idle — ${refusals} refus, abandon`);
+          ctx.ui?.notify?.("pi-reload-self-hardened : rechargement abandonné après 3 refus du garde d'idle", "error");
+          return;
+        }
+        storePendingReloadCommand(args);
+        log(`commande: agent pas idle — refusé (${refusals}/${IDLE_GUARD_MAX_RETRIES}), remis en file`);
+        ctx.ui?.notify?.("pi-reload-self-hardened : attends la fin de la réponse en cours avant de recharger — nouvelle tentative au prochain settlement", "warning");
         return;
       }
       storeContinuationPrompt(continuationPrompt);
       log("commande: reload en cours");
-      await ctx.reload();
+      try {
+        await ctx.reload();
+      } catch (e) {
+        // C1 : un reload qui throw laisse la continuation dans globalThis, où
+        // le PROCHAIN session_start (n'importe quelle raison) l'injecterait
+        // dans une session sans rapport. On la jette maintenant — elle ne
+        // doit JAMAIS survivre à un reload échoué — et on prévient.
+        takeContinuationPrompt();
+        log(`commande: reload échoué — continuation jetée — ${String(e instanceof Error ? (e.stack ?? e.message) : e)}`);
+        ctx.ui?.notify?.("pi-reload-self-hardened : rechargement échoué, continuation jetée, relance le tool", "error");
+      }
     },
   });
 
@@ -221,6 +334,8 @@ export default async function reloadSelfHardenedExtension(pi: ExtensionAPI): Pro
           details: { queued: false, reason: "already-queued" },
         };
       }
+      // File fraîche : le compteur de refus du garde d'idle repart de zéro.
+      globalState()[RETRY_COUNT_SLOT] = 0;
       log("tool: commande stockée, en attente d'agent_settled");
       return {
         content: [{ type: "text" as const, text: "Rechargement en file : la commande part dès que l'agent est totalement settled (événement agent_settled), le prompt de continuation arrivera après le reload." }],
