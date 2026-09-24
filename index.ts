@@ -21,9 +21,13 @@
  * « Use public settled dispatch ») : événement agent_settled au lieu d'un timer
  * de polling, guard d'idle DANS la commande (corrige la course « commande
  * consommée sans reload »), dedup de la commande en attente. Ajouts locaux :
- * logging fichier (le PR est silencieux) et `Promise.resolve` sur
+ * logging fichier (le PR est silencieux), `Promise.resolve` sur
  * `sendUserMessage` (le binding d'extension retourne `undefined`, wrapper
- * interne sans return — un `.catch` direct crashait pi, payé le 2026-09-24).
+ * interne sans return — un `.catch` direct crashait pi, payé le 2026-09-24),
+ * et balayage ABI du slot de continuation (globalThis survit au reload : un
+ * renommage de slot EN VOL perdit la continuation le 2026-09-24 — on lit
+ * toutes les variantes `__piReloadSelf*ContinuationPrompt` plutôt qu'un nom
+ * exact, et on avertit l'utilisateur si un reload revient sans continuation).
  */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -76,11 +80,24 @@ function storeContinuationPrompt(prompt: string): void {
   globalState()[CONTINUATION_SLOT] = prompt;
 }
 
+// ABI entre runtimes : globalThis survit au remplacement du runtime, donc le
+ // code chargé après un reload peut lire un slot écrit par une version
+ // antérieure (renommage en vol — payé le 2026-09-24, local→hardened). On
+ // balaye toutes les variantes du slot plutôt qu'un nom exact ; le dernier
+ // inséré (ordre d'insertion des clés) est le plus récent.
+const CONTINUATION_SLOT_PATTERN = /^__piReloadSelf\w*ContinuationPrompt$/;
+
 function takeContinuationPrompt(): string | undefined {
   const state = globalState();
-  const prompt = state[CONTINUATION_SLOT] as string | undefined;
-  delete state[CONTINUATION_SLOT];
-  return prompt;
+  let latest: string | undefined;
+  for (const key of Object.keys(state)) {
+    if (CONTINUATION_SLOT_PATTERN.test(key)) {
+      const value = state[key] as string | undefined;
+      if (typeof value === "string") latest = value;
+      delete state[key];
+    }
+  }
+  return latest;
 }
 
 function storePendingReloadCommand(command: string): boolean {
@@ -104,7 +121,7 @@ function clearPendingReloadCommand(): void {
 export default async function reloadSelfHardenedExtension(pi: ExtensionAPI): Promise<void> {
   // Après un reload, le prompt de continuation (stocké dans globalThis, qui
   // survit à la mort du runtime) repart en message user follow-up.
-  pi.on("session_start", (event) => {
+  pi.on("session_start", (event, ctx) => {
     // Une commande en attente appartient au run qui l'a créée : si la session
     // est remplacée avant son settlement, on ne la porte pas vers l'avant.
     clearPendingReloadCommand();
@@ -118,6 +135,11 @@ export default async function reloadSelfHardenedExtension(pi: ExtensionAPI): Pro
       void Promise.resolve(pi.sendUserMessage(continuationPrompt, { deliverAs: "followUp" })).catch((e: unknown) =>
         log(`continuation: envoi échoué — ${String(e instanceof Error ? e.message : e)}`),
       );
+    } else if (String((event as { reason?: string }).reason) === "reload") {
+      // Perte de continuation après un reload : ne jamais laisser l'utilisateur
+      // deviner pourquoi le rechargement ne s'est pas enchaîné.
+      log("session_start(reload): AUCUNE continuation — la main est rendue à l'utilisateur");
+      ctx.ui?.notify?.("pi-reload-self-hardened : rechargement effectué SANS continuation (perdue ou jamais stockée) — la main t'est rendue", "warning");
     }
   });
 
