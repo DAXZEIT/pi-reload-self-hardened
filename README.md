@@ -73,21 +73,27 @@ plus four hardenings that came from observed failures:
 ## Tests
 
 ```sh
-npm run check   # tsc --noEmit + node:test suite (20 tests)
+npm run check   # tsc --noEmit + node:test suite (21 tests)
 ```
 
 The fake `pi.sendUserMessage` returns `undefined` by default — exactly the
 real 0.87.1 runtime behavior — so every dispatch test exercises the
 undefined-return path; the harness also models rejecting and
-synchronously-throwing sends. Covered: registration, confirmation gate,
+synchronously-throwing sends. Command-handler tests pass the **real-shape
+args** (the bare post-space token, as `_tryExecuteExtensionCommand`,
+agent-session.js:1336-1348, produces) — only the copied-full-command-text
+test uses the full shape, which is a genuine user scenario. Covered:
+registration, confirmation gate,
 queue/dedup/one-shot dispatch, `agent_settled` timing, rejecting
 `sendUserMessage`, handler exception isolation, in-command idle guard,
 invalid payload (with/without ui), reload + continuation delivery, legacy
 slot recovery, most-recent-slot preference, continuation-less reload
 notification, copied command text, failed-`ctx.reload()` continuation
 discard (C1), non-reload `session_start` residual drop (C3), pending-drop
-warning (C2a), idle-guard re-queue and retry (N1), synchronous-send failure
-re-store (C2c), non-string legacy slot (N2a), idle-guard retry cap (N1).
+warning (C2a), idle-guard re-queue and retry with re-dispatchable
+command-shaped re-store (N1/F1), synchronous-send failure
+re-store (C2c), non-string legacy slot (N2a), idle-guard retry cap in the
+real dispatch/refusal cycle (N1/F2), synchronous-send re-store cap (F3).
 
 ## How it works
 
@@ -130,6 +136,15 @@ by the agent itself.
   intentionally collides (`pi_extension_dev_reload_self` is the same tool) —
   two copies registering the same tool name produce registration-order-
   dependent behavior. Keep exactly one of the two.
+- **A hung `ctx.reload()` is undetectable from the extension** (no timeout
+  API): if the reload never settles, no notify fires and the continuation
+  sits in `globalThis` until the next `session_start` (any reason) drops it
+  with a warning — that gate is the backstop.
+- **A leftover pre-rename pending slot blocks new queues**: the tool's dedup
+  scans all ABI variants of the pending slot, so a pending command written
+  by an older version makes new tool calls return "already-queued" until the
+  next `session_start` clears it (with a warning). The legacy command is
+  dispatched first — deliberate, but a behavior change vs pre-fix.
 
 ## Provenance
 

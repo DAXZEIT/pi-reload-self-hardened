@@ -21,6 +21,16 @@ function encode(payload: { continuationPrompt: string }): string {
   return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
 }
 
+// Réplique fidèle du shape réel des args du handler : sur Pi 0.87.1,
+// _tryExecuteExtensionCommand (agent-session.js:1336-1348) coupe au premier
+// espace et passe `args = text.slice(spaceIndex + 1)` — le handler ne voit
+// JAMAIS le préfixe `/<nom>`. Les tests de commande doivent passer ce shape
+// (token nu), sinon ils masquent des défauts de re-dispatch (F1).
+function realRuntimeArgs(fullText: string): string {
+  const spaceIndex = fullText.indexOf(" ");
+  return spaceIndex === -1 ? "" : fullText.slice(spaceIndex + 1);
+}
+
 interface RegisteredCommand {
   description: string;
   handler: (args: string, ctx: FakeCommandContext) => Promise<void> | void;
@@ -141,7 +151,8 @@ test("tool queues once, dedups, and dispatches exactly once at agent_settled", a
   assert.equal(sentUserMessages.length, 1);
 
   let reloaded = false;
-  await command.handler(sentUserMessages[0].content, {
+  // Le runtime réel passerait le TOKEN NU (texte après le premier espace).
+  await command.handler(realRuntimeArgs(sentUserMessages[0].content), {
     isIdle: () => true,
     reload: async () => {
       reloaded = true;
@@ -361,12 +372,13 @@ test("command idle-guard refusal re-queues and retries at the next settle (N1)",
   await tools.get(TOOL_NAME)?.execute("tool-1", { continuation_prompt: "continue", confirm_state_loss: true });
 
   // Première tentative : settle idle → dispatch, mais le guard refuse et
-  // remet la commande en file au lieu de la jeter.
+  // remet la commande en file au lieu de la jeter. Le handler reçoit le
+  // shape RÉEL des args (token nu après l'espace — agent-session.js:1336-1348).
   await settled({}, { isIdle: () => true });
   assert.equal(sentUserMessages.length, 1);
   const notifications: Array<{ message: string; level: string }> = [];
   let reloaded = false;
-  await command.handler(sentUserMessages[0].content, {
+  await command.handler(realRuntimeArgs(sentUserMessages[0].content), {
     isIdle: () => false,
     reload: async () => {
       reloaded = true;
@@ -376,11 +388,17 @@ test("command idle-guard refusal re-queues and retries at the next settle (N1)",
   assert.equal(reloaded, false);
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0].level, "warning");
-  assert.notEqual((globalThis as Record<string, unknown>)[PENDING_SLOT], undefined); // remis en file
+  // F1 : la commande remise en file est re-dispatchable — forme
+  // `/pi-reload-self-hardened-run <token>`, PAS le token nu (qui échouerait à
+  // la gate `text.startsWith("/")` du runtime réel).
+  const reStored = (globalThis as Record<string, unknown>)[PENDING_SLOT];
+  assert.match(String(reStored), new RegExp(`^\\/${COMMAND_NAME} [A-Za-z0-9_-]+$`));
 
-  // Second settle idle → exactement UN dispatch supplémentaire.
+  // Second settle idle → exactement UN dispatch supplémentaire, lui aussi
+  // command-shaped (le vrai Pi ne dispatche que les textes commençant par "/").
   await settled({}, { isIdle: () => true });
   assert.equal(sentUserMessages.length, 2);
+  assert.match(sentUserMessages[1].content, new RegExp(`^\\/${COMMAND_NAME} [A-Za-z0-9_-]+$`));
 });
 
 test("settled handler re-stores the command when sendUserMessage throws synchronously (C2c)", async () => {
@@ -432,12 +450,14 @@ test("non-string legacy continuation slot is logged and cleared, nothing deliver
   assert.equal(notifications[0].level, "warning");
 });
 
-test("idle-guard gives up after 3 refusals and discards the command (N1 cap)", async () => {
-  const { commands } = await loadExtension();
+test("idle-guard gives up after 3 refusals in the real dispatch/refusal cycle and discards the command (N1 cap)", async () => {
+  const { commands, tools, sentUserMessages, handlers } = await loadExtension();
   const command = commands.get(COMMAND_NAME);
+  const settled = handlers.get("agent_settled")?.[0] as SettledHandler;
   assert.ok(command);
+  assert.ok(settled);
+  await tools.get(TOOL_NAME)?.execute("tool-1", { continuation_prompt: "continue", confirm_state_loss: true });
 
-  const args = encode({ continuationPrompt: "continue" });
   const notifications: Array<{ message: string; level: string }> = [];
   let reloaded = false;
   const ctx = {
@@ -448,19 +468,59 @@ test("idle-guard gives up after 3 refusals and discards the command (N1 cap)", a
     ui: { notify: (message: string, level: string) => notifications.push({ message, level }) },
   };
 
-  // 3 premiers refus : la commande est remise en file (warning).
+  // 3 cycles complets [settle → dispatch → refus] : le compteur grimpe (il
+  // n'est plus remis à zéro au dispatch — F2) et la commande est remise en
+  // file à chaque refus.
   for (let i = 0; i < 3; i++) {
-    await command.handler(args, ctx);
+    await settled({}, { isIdle: () => true });
+    await command.handler(realRuntimeArgs(sentUserMessages[sentUserMessages.length - 1].content), ctx);
     assert.notEqual((globalThis as Record<string, unknown>)[PENDING_SLOT], undefined);
   }
   assert.equal(notifications.filter((n) => n.level === "warning").length, 3);
+  assert.equal(notifications.filter((n) => n.level === "error").length, 0);
 
-  // 4e refus : plafond atteint — la commande est jetée (error), plus de retry.
-  await command.handler(args, ctx);
+  // 4e cycle : dispatch + refus → plafond atteint — la commande est jetée
+  // (error), plus de retry, jamais de 5e dispatch.
+  await settled({}, { isIdle: () => true });
+  assert.equal(sentUserMessages.length, 4);
+  await command.handler(realRuntimeArgs(sentUserMessages[3].content), ctx);
   assert.equal(reloaded, false);
   assert.equal((globalThis as Record<string, unknown>)[PENDING_SLOT], undefined);
-  assert.equal(notifications.length, 4);
-  assert.equal(notifications[3].level, "error");
+  assert.equal(notifications.filter((n) => n.level === "error").length, 1);
+
+  await settled({}, { isIdle: () => true });
+  assert.equal(sentUserMessages.length, 4);
+});
+
+test("settled handler caps synchronous-send re-stores and discards after 3 (F3)", async () => {
+  const first = await loadExtension(() => {
+    throw new Error("Extension runtime stale after session replacement");
+  });
+  const settled = first.handlers.get("agent_settled")?.[0] as SettledHandler;
+  assert.ok(settled);
+  await first.tools.get(TOOL_NAME)?.execute("tool-1", { continuation_prompt: "continue", confirm_state_loss: true });
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  const ctx = { isIdle: () => true, ui: { notify: (message: string, level: string) => notifications.push({ message, level }) } };
+
+  // 3 premiers échecs d'envoi synchrone : commande restaurée + warning.
+  // (Le fake enregistre le message AVANT que le send ne throw — seuls le
+  // re-store du slot et les notifications prouvent le comportement.)
+  for (let i = 0; i < 3; i++) {
+    await Promise.resolve(settled({}, ctx));
+    assert.notEqual((globalThis as Record<string, unknown>)[PENDING_SLOT], undefined);
+  }
+  assert.equal(notifications.filter((n) => n.level === "warning").length, 3);
+  assert.equal(notifications.filter((n) => n.level === "error").length, 0);
+
+  // 4e échec : plafond — la commande est jetée (error), plus de retry.
+  await Promise.resolve(settled({}, ctx));
+  assert.equal((globalThis as Record<string, unknown>)[PENDING_SLOT], undefined);
+  assert.equal(notifications.filter((n) => n.level === "error").length, 1);
+
+  // 5e settle : rien à dispatcher (le fake n'a enregistré que les 4 échecs).
+  await Promise.resolve(settled({}, ctx));
+  assert.equal(first.sentUserMessages.length, 4);
 });
 
 test("command accepts the full copied command text", async () => {
