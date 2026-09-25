@@ -145,6 +145,13 @@ by the agent itself.
   by an older version makes new tool calls return "already-queued" until the
   next `session_start` clears it (with a warning). The legacy command is
   dispatched first — deliberate, but a behavior change vs pre-fix.
+- **Two low-severity retry-budget accounting edges** (surgical review, 2026-09-25,
+  both always end in a *notified* error, never a silent loss): (A1) a pending
+  command recovered from a legacy slot can inherit a stale refusal counter and
+  get a shorter budget; (A2) a refusal counted while the re-store is dedup-
+  rejected leaks one charge onto the occupying command's budget. Fixed in the
+  upstream version (increment after the dedup check; reset counters when
+  dropping a non-empty pending slot).
 
 ## Provenance
 
