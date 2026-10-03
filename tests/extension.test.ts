@@ -107,7 +107,9 @@ test("registers the tool and the internal command", async () => {
   assert.ok(commands.has(COMMAND_NAME));
   assert.ok(tools.has(TOOL_NAME));
 });
-\n\ntest("logging creates the log file on a fresh installation", async () => {
+
+
+test("logging creates the log file on a fresh installation", async () => {
   const logFile = process.env.PI_RELOAD_SELF_HARDENED_LOG ?? "/tmp/pi-reload-self-hardened.log";
   try {
     unlinkSync(logFile);
