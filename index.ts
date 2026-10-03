@@ -253,9 +253,9 @@ export default async function reloadSelfHardenedExtension(pi: ExtensionAPI): Pro
 
   pi.registerTool({
     name: TOOL_NAME,
-    label: "Reload Pi and Continue",
+    label: "Reload Pi",
     description:
-      "Reload Pi extensions, skills, prompts, and themes, then send a small post-reload success signal. " +
+      "Reload Pi extensions, skills, prompts, and themes, then send a minimal post-reload success signal. " +
       "The conversation context is preserved; the signal is exactly « reload successful ». " +
       "WARNING: reload can reset extension-maintained runtime state. Only call this when the user requested " +
       "a reload or extension changes require it. Requires confirm_state_loss: true.",
