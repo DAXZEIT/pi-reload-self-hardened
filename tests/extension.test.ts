@@ -356,7 +356,7 @@ test("session_start handles an asynchronous success-signal rejection", async () 
   assert.equal(notifications[0].level, "warning");
 });
 
-test("session_start recovers legacy pending-command slots", async () => {
+test("agent_settled dispatches a legacy pending-command slot", async () => {
   const { handlers, sentUserMessages } = await loadExtension();
   const settled = handlers.get("agent_settled")?.[0] as SettledHandler;
   assert.ok(settled);
