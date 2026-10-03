@@ -108,7 +108,6 @@ test("registers the tool and the internal command", async () => {
   assert.ok(tools.has(TOOL_NAME));
 });
 
-
 test("logging creates the log file on a fresh installation", async () => {
   const logFile = process.env.PI_RELOAD_SELF_HARDENED_LOG ?? "/tmp/pi-reload-self-hardened.log";
   try {
