@@ -28,8 +28,9 @@ The tool queues a reload. The reload is dispatched only after
 turn is still active.
 
 After `ctx.reload()` succeeds, Pi emits
-`session_start(reason: "reload")`. The extension then sends one small
-follow-up message:
+`session_start(reason: "reload")`. When the reload was tool-initiated (the
+command handler sets a one-shot marker right before `ctx.reload()`), the
+extension sends one small follow-up message:
 
 ```text
 reload successful
@@ -54,11 +55,13 @@ Pi dispatches the extension command
   ↓
 idle guard
   ↓
+one-shot reload-expected marker set in globalThis
+  ↓
 ctx.reload()
   ↓
-session_start(reason: "reload")
+session_start(reason: "reload") — marker consumed
   ↓
-"reload successful"
+"reload successful" (tool-initiated reload only)
   ↓
 new turn with the existing conversation context
 ```
@@ -141,6 +144,9 @@ by the agent itself.
   live cycle was subsequently observed on **Pi 1.0.0**.
 - The post-reload message is deliberately fixed to `reload successful`; it
   is a state signal, not task content.
+- A **manual `/reload` stays silent**: no signal, no turn. Only a
+  tool-initiated reload sets the one-shot marker that triggers the message;
+  a stale marker (failed reload, session change) is always discarded.
 
 ## Provenance
 

@@ -12,9 +12,11 @@
  *        → pi.sendUserMessage("/pi-reload-self-hardened-run", { deliverAs: "followUp",
  *             expandPromptTemplates: true })
  *        → prompt() dispatche la commande extension
- *        → handler : guard isIdle + await ctx.reload()
- *        → session_start(reason: "reload")
+ *        → handler : guard isIdle + marqueur one-shot reload-expected + await ctx.reload()
+ *        → session_start(reason: "reload") — le marqueur est consommé
  *        → sendUserMessage("reload successful", { deliverAs: "followUp" })
+ *          (uniquement si le marqueur était posé : un /reload manuel reste
+ *           silencieux — ni signal, ni turn)
  *        → nouveau turn, contexte conversationnel intact.
  *
  * Architecture alignée sur le PR #1 de clankercode/pi-reload-self (limitsurface,
@@ -39,6 +41,7 @@ const TOOL_NAME = "pi_extension_dev_reload_self";
 const RELOAD_COMMAND = `/${COMMAND_NAME}`;
 const RELOAD_SUCCESS_MESSAGE = "reload successful";
 const PENDING_COMMAND_SLOT = "__piReloadSelfHardenedPendingCommand";
+const RELOAD_EXPECTED_SLOT = "__piReloadSelfHardenedReloadExpected";
 
 // Compteur de refus du garde d'idle : volontairement hors des patterns ABI.
 const RETRY_COUNT_SLOT = "__piReloadSelfHardenedRetryCount";
@@ -77,6 +80,7 @@ function globalState(): Record<string, unknown> {
 // code chargé après un reload peut lire un slot écrit par une version
 // antérieure (renommage en vol). On balaie toutes les variantes du slot.
 const PENDING_COMMAND_SLOT_PATTERN = /^__piReloadSelf\w*PendingCommand$/;
+const RELOAD_EXPECTED_SLOT_PATTERN = /^__piReloadSelf\w*ReloadExpected$/;
 
 function storePendingReloadCommand(command: string): boolean {
   const state = globalState();
@@ -103,6 +107,23 @@ function takePendingReloadCommand(): string | undefined {
   return latest;
 }
 
+// Marqueur one-shot : posé par le handler de commande juste avant
+// ctx.reload(), pour que session_start(reload) distingue un reload déclenché
+// par le tool (envoie le signal) d'un /reload manuel (silencieux — ni
+// signal, ni tour).
+function takeReloadExpected(): boolean {
+  const state = globalState();
+  let found = false;
+  for (const key of Object.keys(state)) {
+    if (RELOAD_EXPECTED_SLOT_PATTERN.test(key)) {
+      if (state[key] !== true) log(`slot reload-expected non-booleen (${typeof state[key]}) jeté`);
+      delete state[key];
+      found = true;
+    }
+  }
+  return found;
+}
+
 function retryCount(): number {
   const value = globalState()[RETRY_COUNT_SLOT];
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
@@ -127,10 +148,26 @@ export default async function reloadSelfHardenedExtension(pi: ExtensionAPI): Pro
         );
       }
 
+      // Le marqueur one-shot est toujours consommé : un marqueur résiduel
+      // (reload interrompu par exemple) ne doit jamais survivre, il pourrait
+      // déclencher un signal à faux sur un /reload manuel ultérieur.
+      const expected = takeReloadExpected();
+
+      if (reason !== "reload") {
+        if (expected) log(`session_start(${reason}): marqueur reload-expected résiduel jeté`);
+        return;
+      }
+
+      // /reload manuel (pas déclenché via le tool) : pas de signal, pas de
+      // tour. Le contexte conversationnel survit au reload — il n'y a rien à
+      // annoncer.
+      if (!expected) {
+        log("session_start(reload): reload manuel — pas de signal");
+        return;
+      }
+
       // Le contexte conversationnel survit au reload : le nouveau runtime n'a
       // besoin que d'un petit signal explicite confirmant que le reload est terminé.
-      if (reason !== "reload") return;
-
       log(`session_start(${reason}): signal de succès envoyé (${RELOAD_SUCCESS_MESSAGE.length} chars)`);
       try {
         void Promise.resolve(
@@ -239,9 +276,14 @@ export default async function reloadSelfHardenedExtension(pi: ExtensionAPI): Pro
       }
 
       log("commande: reload en cours");
+      // Marqueur one-shot pour le session_start(reload) du nouveau runtime.
+      globalState()[RELOAD_EXPECTED_SLOT] = true;
       try {
         await ctx.reload();
       } catch (e) {
+        // Reload échoué : le marqueur ne doit pas rester — il pourrait
+        // déclencher un signal à faux sur un /reload manuel ultérieur.
+        takeReloadExpected();
         log(`commande: reload échoué — ${String(e instanceof Error ? (e.stack ?? e.message) : e)}`);
         ctx.ui?.notify?.(
           "pi-reload-self-hardened : rechargement échoué — la main t'est rendue",

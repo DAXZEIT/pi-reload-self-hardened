@@ -10,6 +10,7 @@ const RELOAD_COMMAND = `/${COMMAND_NAME}`;
 const RELOAD_SUCCESS_MESSAGE = "reload successful";
 const PENDING_SLOT = "__piReloadSelfHardenedPendingCommand";
 const LEGACY_PENDING_SLOT = "__piReloadSelfLocalPendingCommand";
+const RELOAD_EXPECTED_SLOT = "__piReloadSelfHardenedReloadExpected";
 
 interface RegisteredCommand {
   description: string;
@@ -284,16 +285,60 @@ test("command reports reload failures without propagating", async () => {
   assert.equal(notifications[0].level, "error");
 });
 
-test("session_start(reload) sends only the minimal success signal", async () => {
-  const { handlers, sentUserMessages } = await loadExtension();
+test("session_start(reload) sends the success signal for a tool-initiated reload", async () => {
+  const { commands, handlers, sentUserMessages } = await loadExtension();
+  const command = commands.get(COMMAND_NAME);
   const sessionStart = handlers.get("session_start")?.[0] as SessionStartHandler;
+  assert.ok(command);
   assert.ok(sessionStart);
+
+  // Le handler de commande pose le marqueur one-shot avant ctx.reload().
+  await command.handler("", {
+    isIdle: () => true,
+    reload: async () => {},
+  });
 
   await sessionStart({ reason: "reload" }, {});
 
   assert.deepEqual(sentUserMessages, [
     { content: RELOAD_SUCCESS_MESSAGE, options: { deliverAs: "followUp" } },
   ]);
+  assert.equal((globalThis as Record<string, unknown>)[RELOAD_EXPECTED_SLOT], undefined);
+});
+
+test("a manual session_start(reload) without the tool sends no signal", async () => {
+  const { handlers, sentUserMessages } = await loadExtension();
+  const sessionStart = handlers.get("session_start")?.[0] as SessionStartHandler;
+  assert.ok(sessionStart);
+
+  await sessionStart({ reason: "reload" }, {});
+
+  assert.deepEqual(sentUserMessages, []);
+});
+
+test("a stale reload-expected marker is discarded on a non-reload session_start", async () => {
+  const { handlers, sentUserMessages } = await loadExtension();
+  const sessionStart = handlers.get("session_start")?.[0] as SessionStartHandler;
+  assert.ok(sessionStart);
+  (globalThis as Record<string, unknown>)[RELOAD_EXPECTED_SLOT] = true;
+
+  await sessionStart({ reason: "new" }, {});
+
+  assert.deepEqual(sentUserMessages, []);
+  assert.equal((globalThis as Record<string, unknown>)[RELOAD_EXPECTED_SLOT], undefined);
+});
+
+test("a failed ctx.reload() clears the reload-expected marker", async () => {
+  const { commands } = await loadExtension();
+  const command = commands.get(COMMAND_NAME);
+  assert.ok(command);
+
+  await command.handler("", {
+    isIdle: () => true,
+    reload: async () => { throw new Error("boom"); },
+  });
+
+  assert.equal((globalThis as Record<string, unknown>)[RELOAD_EXPECTED_SLOT], undefined);
 });
 
 test("session_start(non-reload) does not send the success signal", async () => {
@@ -329,6 +374,7 @@ test("session_start handles a synchronous success-signal send failure", async ()
   });
   const sessionStart = handlers.get("session_start")?.[0] as SessionStartHandler;
   assert.ok(sessionStart);
+  (globalThis as Record<string, unknown>)[RELOAD_EXPECTED_SLOT] = true; // reload déclenché par le tool
 
   const notifications: Array<{ message: string; level: string }> = [];
   await sessionStart(
@@ -344,6 +390,7 @@ test("session_start handles an asynchronous success-signal rejection", async () 
   const { handlers } = await loadExtension(() => Promise.reject(new Error("send failed")));
   const sessionStart = handlers.get("session_start")?.[0] as SessionStartHandler;
   assert.ok(sessionStart);
+  (globalThis as Record<string, unknown>)[RELOAD_EXPECTED_SLOT] = true; // reload déclenché par le tool
 
   const notifications: Array<{ message: string; level: string }> = [];
   await sessionStart(
