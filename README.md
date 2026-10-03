@@ -128,7 +128,7 @@ by the agent itself.
 
 - Pi coding agent `>=0.87.1`
 - Node.js >= 20
-- no additional runtime dependencies beyond Pi's extension environment
+- `typebox` available in the Pi extension environment
 
 ## Notes
 
