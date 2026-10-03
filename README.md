@@ -20,7 +20,7 @@ out immediately, so the tool always falls back to the manual editor path.
 PR #1 removes the monkeypatch in favor of the public API. This repository is
 that design, validated end-to-end on 0.87.1 (2026-09-24: full cycles,
 tool → reload in ~300–700 ms → continuation turn, zero manual intervention),
-plus four hardenings that came from observed failures:
+plus five hardenings that came from observed failures:
 
 ## Production hardening (beyond PR #1)
 
@@ -98,8 +98,9 @@ notification, copied command text, failed-`ctx.reload()` continuation
 discard (C1), non-reload `session_start` residual drop (C3), pending-drop
 warning (C2a), idle-guard re-queue and retry with re-dispatchable
 command-shaped re-store (N1/F1), synchronous-send failure
-re-store (C2c), non-string legacy slot (N2a), idle-guard retry cap in the
-real dispatch/refusal cycle (N1/F2), synchronous-send re-store cap (F3).
+re-store (C2c), continuation-send failure recovery, fresh-install log creation,
+non-string legacy slot (N2a), idle-guard retry cap in the real dispatch/refusal
+cycle (N1/F2), synchronous-send re-store cap (F3).
 
 ## How it works
 
