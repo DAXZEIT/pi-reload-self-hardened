@@ -20,7 +20,7 @@ out immediately, so the tool always falls back to the manual editor path.
 PR #1 removes the monkeypatch in favor of the public API. This repository is
 that design, validated end-to-end on 0.87.1 (2026-09-24: full cycles,
 tool → reload in ~300–700 ms → continuation turn, zero manual intervention),
-plus four hardenings that came from observed failures:
+plus five hardenings that came from observed failures:
 
 ## Production hardening (beyond PR #1)
 
@@ -31,7 +31,8 @@ plus four hardenings that came from observed failures:
    two steps is indistinguishable from "it didn't reload". The log records
    every step and every guard decision. It is what made the 0.87.x behavior
    debuggable in the first place. **The continuation prompt content is never
-   written** — only its length.
+   written** — only its length. The logger also creates the file on a fresh
+   installation instead of requiring it to exist beforehand.
 
 2. **`Promise.resolve()` around `pi.sendUserMessage()`**
    The extension binding returns `undefined` at runtime — the internal
@@ -55,7 +56,12 @@ plus four hardenings that came from observed failures:
    isolation — applied consistently to both the `agent_settled` and the
    `session_start` handler.
 
-4. **Slot ABI scans + no-silent-failure**
+4. **Continuation-send recovery**
+   If the post-reload follow-up message fails synchronously or returns a
+   rejecting promise, the continuation is restored to `globalThis` and the
+   user is warned instead of losing the continuation silently.
+
+5. **Slot ABI scans + no-silent-failure**
    `globalThis` survives the runtime replacement, so a slot renamed across a
    reload (in-flight code change) would be written by the old version and
    missed by the new one — the continuation would be dropped **silently** and
@@ -73,7 +79,7 @@ plus four hardenings that came from observed failures:
 ## Tests
 
 ```sh
-npm run check   # tsc --noEmit + node:test suite (21 tests)
+npm run check   # tsc --noEmit + node:test suite (24 tests)
 ```
 
 The fake `pi.sendUserMessage` returns `undefined` by default — exactly the
@@ -92,8 +98,9 @@ notification, copied command text, failed-`ctx.reload()` continuation
 discard (C1), non-reload `session_start` residual drop (C3), pending-drop
 warning (C2a), idle-guard re-queue and retry with re-dispatchable
 command-shaped re-store (N1/F1), synchronous-send failure
-re-store (C2c), non-string legacy slot (N2a), idle-guard retry cap in the
-real dispatch/refusal cycle (N1/F2), synchronous-send re-store cap (F3).
+re-store (C2c), continuation-send failure recovery, fresh-install log creation,
+non-string legacy slot (N2a), idle-guard retry cap in the real dispatch/refusal
+cycle (N1/F2), synchronous-send re-store cap (F3).
 
 ## How it works
 

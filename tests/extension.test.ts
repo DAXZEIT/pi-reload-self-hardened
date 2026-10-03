@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync, unlinkSync } from "node:fs";
 import test from "node:test";
 
 import extension from "../index.ts";
@@ -105,6 +106,18 @@ test("registers the tool and the internal command", async () => {
   const { commands, tools } = await loadExtension();
   assert.ok(commands.has(COMMAND_NAME));
   assert.ok(tools.has(TOOL_NAME));
+});
+
+test("logging creates the log file on a fresh installation", async () => {
+  const logFile = process.env.PI_RELOAD_SELF_HARDENED_LOG ?? "/tmp/pi-reload-self-hardened.log";
+  try {
+    unlinkSync(logFile);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+
+  await loadExtension();
+  assert.equal(existsSync(logFile), true);
 });
 
 test("tool refuses to queue without confirm_state_loss", async () => {
@@ -237,6 +250,55 @@ test("command survives an invalid payload when ui is unavailable", async () => {
       },
     });
   });
+});
+
+test("session_start restores the continuation when follow-up send rejects", async () => {
+  const { commands, handlers } = await loadExtension(() => Promise.reject(new Error("send failed")));
+  const command = commands.get(COMMAND_NAME);
+  const sessionStart = handlers.get("session_start")?.[0] as SessionStartHandler;
+  assert.ok(command);
+  assert.ok(sessionStart);
+
+  await command.handler(encode({ continuationPrompt: "continue after retry" }), {
+    isIdle: () => true,
+    reload: async () => {},
+  });
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  await sessionStart(
+    { reason: "reload" },
+    { ui: { notify: (message: string, level: string) => notifications.push({ message, level }) } },
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal((globalThis as Record<string, unknown>)[CURRENT_SLOT], "continue after retry");
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].level, "warning");
+});
+
+test("session_start restores the continuation when follow-up send throws synchronously", async () => {
+  const { commands, handlers } = await loadExtension(() => {
+    throw new Error("stale session");
+  });
+  const command = commands.get(COMMAND_NAME);
+  const sessionStart = handlers.get("session_start")?.[0] as SessionStartHandler;
+  assert.ok(command);
+  assert.ok(sessionStart);
+
+  await command.handler(encode({ continuationPrompt: "continue after sync failure" }), {
+    isIdle: () => true,
+    reload: async () => {},
+  });
+
+  const notifications: Array<{ message: string; level: string }> = [];
+  await sessionStart(
+    { reason: "reload" },
+    { ui: { notify: (message: string, level: string) => notifications.push({ message, level }) } },
+  );
+
+  assert.equal((globalThis as Record<string, unknown>)[CURRENT_SLOT], "continue after sync failure");
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].level, "warning");
 });
 
 test("command reloads and session_start delivers the continuation", async () => {
