@@ -72,7 +72,14 @@ const LOG_FILE = process.env.PI_RELOAD_SELF_HARDENED_LOG ?? "/tmp/pi-reload-self
 
 function log(msg: string): void {
   try {
-    if (statSync(LOG_FILE).size > LOG_MAX_BYTES) renameSync(LOG_FILE, `${LOG_FILE}.1`);
+    let size = 0;
+    try {
+      size = statSync(LOG_FILE).size;
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT") throw e;
+    }
+    if (size > LOG_MAX_BYTES) renameSync(LOG_FILE, `${LOG_FILE}.1`);
     appendFileSync(LOG_FILE, `${new Date().toISOString()} ${msg}\n`);
   } catch {
     // diagnostic optionnel — ne doit JAMAIS jeter dans le flux
@@ -217,9 +224,19 @@ export default async function reloadSelfHardenedExtension(pi: ExtensionAPI): Pro
         // Le binding d'extension peut retourner undefined (wrapper interne sans
         // return) : Promise.resolve évite un crash et reste compatible avec un
         // futur pi qui retournerait une vraie promise.
-        void Promise.resolve(pi.sendUserMessage(continuationPrompt, { deliverAs: "followUp" })).catch((e: unknown) =>
-          log(`continuation: envoi échoué — ${String(e instanceof Error ? e.message : e)}`),
-        );
+        try {
+          void Promise.resolve(pi.sendUserMessage(continuationPrompt, { deliverAs: "followUp" })).catch((e: unknown) => {
+            storeContinuationPrompt(continuationPrompt);
+            log(`continuation: envoi échoué — continuation restaurée (${continuationPrompt.length} chars) — ${String(e instanceof Error ? e.message : e)}`);
+            ctx.ui?.notify?.("pi-reload-self-hardened : envoi de la continuation échoué — elle reste en attente d'un prochain session_start", "warning");
+          });
+        } catch (e) {
+          // Même protection que le dispatch : le binding actuel peut throw
+          // synchroniquement avant que Promise.resolve(...) ne soit créé.
+          storeContinuationPrompt(continuationPrompt);
+          log(`continuation: envoi synchrone échoué — continuation restaurée (${continuationPrompt.length} chars) — ${String(e instanceof Error ? (e.stack ?? e.message) : e)}`);
+          ctx.ui?.notify?.("pi-reload-self-hardened : envoi de la continuation échoué — elle reste en attente d'un prochain session_start", "warning");
+        }
       } else {
         // Perte de continuation après un reload : ne jamais laisser l'utilisateur
         // deviner pourquoi le rechargement ne s'est pas enchaîné.
