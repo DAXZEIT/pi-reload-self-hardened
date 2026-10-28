@@ -21,7 +21,7 @@
     ]
   },
   "scripts": {
-    "test": "PI_RELOAD_SELF_HARDENED_LOG=/tmp/pi-reload-self-hardened.test.log node --import tsx --test tests/extension.test.ts",
+    "test": "PI_RELOAD_SELF_HARDENED_LOG=./pi-reload-self-hardened.test.log node --import tsx --test tests/extension.test.ts",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test"
   },

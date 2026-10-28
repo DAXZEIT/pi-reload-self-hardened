@@ -40,10 +40,66 @@ The conversation context is preserved by Pi, so there is **no continuation
 prompt to serialize, carry through `globalThis`, or replay**. The post-reload
 message is only an explicit success signal to the agent.
 
+## Optional context limit
+
+By default there is **no limit**. Set a per-session, branch-aware preference
+with the user slash command:
+
+```text
+/reload-self-limit 100K   # set 100,000 estimated context tokens
+/reload-self-limit 50000 # an integer number of tokens
+/reload-self-limit 50K   # K = 1,000 (decimal)
+/reload-self-limit 1M    # M = 1,000,000 (decimal)
+/reload-self-limit off   # disable the limit
+/reload-self-limit       # show the current value without changing it
+```
+
+Enter only the command and value (the comments above are explanatory).
+Values must be positive safe integers, optionally followed by K or M
+(case-insensitive). Zero, negative values, fractional values, non-finite
+values and unsafe integers are rejected without changing the preference.
+
+The preference is persisted with `pi.appendEntry()` as a dedicated
+`pi-reload-self-hardened-limit` custom entry (`{ version: 1, tokens }`, where
+`null` means off), **outside the model context**. The latest valid entry on
+the current branch wins. It survives reload/resume, follows branch navigation,
+and is not inherited by an unrelated new session. There is no global settings
+change.
+
+The guard applies to **all models**, including local/free models; model prices
+are not used to infer billing status. The tool has no parameter to bypass or
+change the limit. `confirm_state_loss: true` remains the first requirement.
+
+When enabled, the guard reads `ctx.getContextUsage()?.tokens`: this is an
+**estimate**, not an exact token count or a cost guarantee. A usage strictly
+**greater than** the limit refuses the reload; equality is allowed. For 100K,
+the refusal is:
+
+```text
+You are currently above the reload-self limit (currently set at 100K tokens) — ask the user to compact before using this tool. Compaction commands: /pi-vcc or /compact.
+```
+
+On the current machine `/pi-vcc` is available; `/compact` is also supported.
+Immediately after compaction, the estimate can be null or absent. With a limit
+enabled, that produces a **distinct refusal** asking to retry after an assistant
+response; the extension never falls back to a previously measured count. With
+the limit off, no measurement is needed.
+
+Usage and the current preference are read twice: at the tool call, before
+queueing, and immediately before the deferred `ctx.reload()`. This closes the
+race where the context grows between the tool call and `agent_settled` (or
+between dispatch and the internal command). A deferred refusal drops the
+request, sets no success marker, and does not auto-retry. It is shown as a
+warning and recorded as a visible custom message for the next model turn,
+without triggering a new turn. After compaction and an assistant response,
+call the tool again; refusals are never cached.
+
 ## How it works
 
 ```text
 tool (confirm_state_loss: true)
+  ↓
+context-limit guard (if configured)
   ↓
 pending reload command stored in globalThis (dedup)
   ↓
@@ -54,6 +110,8 @@ agent_settled
 Pi dispatches the extension command
   ↓
 idle guard
+  ↓
+fresh context-limit guard (if configured)
   ↓
 one-shot reload-expected marker set in globalThis
   ↓
@@ -67,8 +125,9 @@ new turn with the existing conversation context
 ```
 
 No monkeypatching and no private API are used. The extension relies on
-`registerTool`, `registerCommand`, `pi.sendUserMessage`, `ctx.reload()`,
-and the public `session_start` / `agent_settled` events.
+`registerTool`, `registerCommand`, `pi.appendEntry`, `pi.sendMessage`,
+`pi.sendUserMessage`, `ctx.getContextUsage()`, `ctx.sessionManager.getBranch()`,
+`ctx.reload()`, and the public `session_start` / `agent_settled` events.
 
 ## Hardening
 
@@ -109,13 +168,20 @@ silently.
 ## Tests
 
 ```sh
-npm run check   # tsc --noEmit + node:test suite (21 tests)
+npm run check   # tsc --noEmit + complete node:test suite (50 tests)
+npm test        # complete node:test suite only
 ```
 
 The test harness models the current `undefined` return value of
 `sendUserMessage`, future rejecting-Promise behaviour, synchronous failures,
 idle-guard retries, pending-slot ABI recovery, reload failures, and fresh-install
-logging.
+logging. It also checks context-limit boundaries (below/equal/above), off/default,
+confirmation precedence, null/absent post-compaction measurements, deferred
+context growth, preference persistence and branch isolation, command validation,
+and all-model enforcement. Refusal scenarios explicitly assert zero calls to
+`reload()` and no pending command or success marker. Reloads are mocked; the
+suite never reloads the running Pi process. Test logs stay in the repository
+(`pi-reload-self-hardened.test.log`, ignored by Git).
 
 ## Installation
 

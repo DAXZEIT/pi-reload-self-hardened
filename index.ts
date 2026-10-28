@@ -32,7 +32,7 @@
  * - no-silent-failure sur les pertes d'état
  * - caps de retry pour le garde d'idle et les sends synchrones
  */ 
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { appendFileSync, renameSync, statSync } from "node:fs";
 
@@ -40,6 +40,71 @@ const COMMAND_NAME = "pi-reload-self-hardened-run";
 const TOOL_NAME = "pi_extension_dev_reload_self";
 const RELOAD_COMMAND = `/${COMMAND_NAME}`;
 const RELOAD_SUCCESS_MESSAGE = "reload successful";
+const LIMIT_COMMAND_NAME = "reload-self-limit";
+const LIMIT_ENTRY_TYPE = "pi-reload-self-hardened-limit";
+
+interface ReloadLimitPreference {
+  version: 1;
+  tokens: number | null;
+}
+
+function isValidLimit(tokens: unknown): tokens is number {
+  return typeof tokens === "number" && Number.isSafeInteger(tokens) && tokens > 0;
+}
+
+// Les suffixes sont décimaux (K = 1 000, M = 1 000 000), pas binaires.
+function parseLimit(value: string): number | null | undefined {
+  if (value.toLowerCase() === "off") return null;
+  const match = /^(\d+)([km]?)$/i.exec(value);
+  if (!match) return undefined;
+  const multiplier = { "": 1, k: 1_000, m: 1_000_000 }[match[2].toLowerCase()]!;
+  const tokens = Number(match[1]) * multiplier;
+  return isValidLimit(tokens) ? tokens : undefined;
+}
+
+function formatLimit(tokens: number): string {
+  if (tokens % 1_000_000 === 0) return `${tokens / 1_000_000}M`;
+  if (tokens % 1_000 === 0) return `${tokens / 1_000}K`;
+  return String(tokens);
+}
+
+// Pas de cache runtime/global : la branche active est l'unique source de vérité,
+// y compris après reload, resume, /new et navigation dans l'arbre.
+function readLimit(ctx: ExtensionContext): number | null {
+  const branch = ctx.sessionManager.getBranch();
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const entry = branch[i];
+    if (entry.type !== "custom" || entry.customType !== LIMIT_ENTRY_TYPE) continue;
+    const data = entry.data as Partial<ReloadLimitPreference> | null | undefined;
+    if (data?.version === 1 && (data.tokens === null || isValidLimit(data.tokens))) {
+      return data.tokens;
+    }
+  }
+  return null;
+}
+
+function checkReloadLimit(ctx: ExtensionContext): { reason: string; text: string } | undefined {
+  const limit = readLimit(ctx);
+  if (limit === null) return;
+
+  // Toujours une mesure fraîche : null après compaction n'autorise jamais
+  // la réutilisation d'un compteur antérieur.
+  const tokens = ctx.getContextUsage()?.tokens;
+  if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens < 0) {
+    return {
+      reason: "context-usage-unavailable",
+      text: "Reload-self context usage estimate is unavailable — retry after an assistant response. " +
+        "This can happen just after compaction (/pi-vcc or /compact).",
+    };
+  }
+  if (tokens > limit) {
+    return {
+      reason: "context-limit-exceeded",
+      text: `You are currently above the reload-self limit (currently set at ${formatLimit(limit)} tokens) — ask the user to compact before using this tool. ` +
+        "Compaction commands: /pi-vcc or /compact.",
+    };
+  }
+}
 const PENDING_COMMAND_SLOT = "__piReloadSelfHardenedPendingCommand";
 const RELOAD_EXPECTED_SLOT = "__piReloadSelfHardenedReloadExpected";
 
@@ -241,6 +306,32 @@ export default async function reloadSelfHardenedExtension(pi: ExtensionAPI): Pro
     }
   });
 
+  pi.registerCommand(LIMIT_COMMAND_NAME, {
+    description: "Show/set the reload-self context limit: [positive tokens | 100K | 1M | off]",
+    handler: async (args, ctx) => {
+      const value = args.trim();
+      if (!value) {
+        const limit = readLimit(ctx);
+        ctx.ui.notify(
+          limit === null ? "Reload-self limit: off (no limit)." : `Reload-self limit: ${formatLimit(limit)} tokens (estimated context usage).`,
+          "info",
+        );
+        return;
+      }
+      const tokens = parseLimit(value);
+      if (tokens === undefined) {
+        ctx.ui.notify("Usage: /reload-self-limit [positive integer tokens | 100K | 1M | off]. K = 1000, M = 1000000; the result must be a safe positive integer.", "error");
+        return;
+      }
+      // Entrée custom, pas un message : préférence persistée HORS contexte modèle.
+      pi.appendEntry<ReloadLimitPreference>(LIMIT_ENTRY_TYPE, { version: 1, tokens });
+      ctx.ui.notify(
+        tokens === null ? "Reload-self limit: off (no limit)." : `Reload-self limit: ${formatLimit(tokens)} tokens (estimated context usage).`,
+        "info",
+      );
+    },
+  });
+
   pi.registerCommand(COMMAND_NAME, {
     description: "Interne : recharge Pi puis confirme avec « reload successful »",
     handler: async (_args, ctx: ExtensionCommandContext) => {
@@ -275,6 +366,21 @@ export default async function reloadSelfHardenedExtension(pi: ExtensionAPI): Pro
         return;
       }
 
+      // Deuxième lecture, au dernier instant : le contexte/la préférence a pu
+      // changer depuis l'appel du tool et le dispatch agent_settled.
+      const refusal = checkReloadLimit(ctx);
+      if (refusal) {
+        takePendingReloadCommand();
+        log(`commande: reload refusé (${refusal.reason})`);
+        ctx.ui?.notify?.(refusal.text, "warning");
+        pi.sendMessage({
+          customType: "pi-reload-self-hardened-refusal",
+          content: refusal.text,
+          display: true,
+        }, { triggerTurn: false });
+        return;
+      }
+
       log("commande: reload en cours");
       // Marqueur one-shot pour le session_start(reload) du nouveau runtime.
       globalState()[RELOAD_EXPECTED_SLOT] = true;
@@ -300,13 +406,14 @@ export default async function reloadSelfHardenedExtension(pi: ExtensionAPI): Pro
       "Reload Pi extensions, skills, prompts, and themes, then send a minimal post-reload success signal. " +
       "The conversation context is preserved; the signal is exactly « reload successful ». " +
       "WARNING: reload can reset extension-maintained runtime state. Only call this when the user requested " +
-      "a reload or extension changes require it. Requires confirm_state_loss: true.",
+      "a reload or extension changes require it. Requires confirm_state_loss: true. " +
+      "Subject to the user-configured /reload-self-limit for all models; compact first if above it.",
     parameters: Type.Object({
       confirm_state_loss: Type.Boolean({
         description: "Must be true. Confirms acceptance that reload may reset extension-maintained runtime state.",
       }),
     }),
-    async execute(_toolCallId, params: { confirm_state_loss: boolean }) {
+    async execute(_toolCallId, params: { confirm_state_loss: boolean }, _signal, _onUpdate, ctx) {
       if (!params.confirm_state_loss) {
         return {
           content: [
@@ -316,6 +423,16 @@ export default async function reloadSelfHardenedExtension(pi: ExtensionAPI): Pro
             },
           ],
           details: { queued: false, reason: "missing-confirmation" },
+        };
+      }
+
+      const refusal = checkReloadLimit(ctx);
+      if (refusal) {
+        log(`tool: reload refusé (${refusal.reason})`);
+        return {
+          content: [{ type: "text" as const, text: refusal.text }],
+          details: { queued: false, reason: refusal.reason },
+          isError: true,
         };
       }
 
